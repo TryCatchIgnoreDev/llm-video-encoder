@@ -1,0 +1,10 @@
+{
+  "name": "llm-video-encoder",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "End-to-end pipeline for rendering live 3Blue1Brown-style LLM Arithmetic Coding vs ZIP overlays synced word-by-word to any video.",
+  "dependencies": {
+    "playwright-core": "^1.50.0"
+  }
+}

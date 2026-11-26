@@ -1,0 +1,863 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>LLM Video Encoder Overlay</title>
+  <style>
+    html, body { margin: 0; padding: 0; background: transparent; overflow: hidden; }
+    canvas { display: block; background: transparent; }
+  </style>
+</head>
+<body>
+  <canvas id="ov"></canvas>
+  <script>
+    // Reusable Theme Presets (overridable per-job via job.json `theme` + `palette`)
+    const THEMES = {
+      'dark-slate': {
+        mode: 'dark',
+        bg: '#090C0F', bgAlpha: 0.88, track: '#121920', rule: '#495A68',
+        ash: '#95A7B5', fg: '#F1F5F8', signal: '#E8452C', accent: '#FF9642',
+        zlib: '#58A4BC', zlibFresh: '#94DCED', border: '#495A68', borderAlpha: 0.55,
+      },
+      'dark-forest': {
+        mode: 'dark',
+        bg: '#0C110E', bgAlpha: 0.86, track: '#16201A', rule: '#5A6658',
+        ash: '#B3B9A8', fg: '#F7F1E5', signal: '#E94B43', accent: '#F5C15C',
+        zlib: '#73A996', zlibFresh: '#9CE0C9', border: '#F5C15C', borderAlpha: 0.28,
+      },
+      'warm-cinema': {
+        mode: 'dark',
+        bg: '#110C0A', bgAlpha: 0.87, track: '#1D1411', rule: '#6C564C',
+        ash: '#C3AEA2', fg: '#FAF2EA', signal: '#E63950', accent: '#F7B84B',
+        zlib: '#5AA5A8', zlibFresh: '#8EE3E6', border: '#F7B84B', borderAlpha: 0.34,
+      },
+      'neon-pop': {
+        mode: 'dark',
+        bg: '#0A0916', bgAlpha: 0.88, track: '#15132B', rule: '#524D7A',
+        ash: '#A9A5CC', fg: '#F5F4FF', signal: '#FF2E7E', accent: '#FFB830',
+        zlib: '#38BDF8', zlibFresh: '#7DD3FC', border: '#FF2E7E', borderAlpha: 0.38,
+      },
+      'light-lab': {
+        mode: 'light',
+        bg: '#FAFBFD', bgAlpha: 0.94, track: '#EEF2F7', rule: '#94A3B8',
+        ash: '#475569', fg: '#0F172A', signal: '#DC2626', accent: '#1D4ED8',
+        zlib: '#0F766E', zlibFresh: '#14B8A6', border: '#0F172A', borderAlpha: 0.28,
+      },
+    };
+
+    const clamp = (x, lo = 0, hi = 1) => Math.max(lo, Math.min(hi, x));
+    const lerp = (a, b, t) => a + (b - a) * t;
+    const prog = (t, t0, t1) => clamp((t - t0) / Math.max(1e-6, t1 - t0));
+    const smoothstep = (e0, e1, x) => {
+      const u = clamp((x - e0) / Math.max(1e-6, e1 - e0));
+      return u * u * (3 - 2 * u);
+    };
+    const ease = {
+      outQuad: (x) => 1 - (1 - x) * (1 - x),
+      outCubic: (x) => 1 - Math.pow(1 - x, 3),
+      inOutCubic: (x) => (x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2),
+    };
+
+    const PW = 540;
+    const PH = 252;
+    const PAD_X = 14;
+    const PLOT_X0 = PAD_X;
+    const PLOT_X1 = PW - PAD_X;
+    const PLOT_W = PLOT_X1 - PLOT_X0;
+    const PLOT_CX = (PLOT_X0 + PLOT_X1) * 0.5;
+    const AXIS_Y = 137;
+    const TARGET_FRAC = 0.68;
+    const MAX_ROWS = 4;
+    const ROW_H = 19.2;
+    const ROW_GAP = 2.4;
+    const ROW_STEP = ROW_H + ROW_GAP;
+
+    const FONT_SANS = '"Archivo-1000-700", "Segoe UI", system-ui, sans-serif';
+    const FONT_MONO_REG = '"Plex-400", "Cascadia Mono", Consolas, monospace';
+    const FONT_MONO_MED = '"Plex-500", "Cascadia Mono", Consolas, monospace';
+
+    const mCanvas = document.createElement('canvas');
+    const mCtx = mCanvas.getContext('2d');
+    function measure(text, fontSpec) {
+      mCtx.font = fontSpec;
+      return mCtx.measureText(text).width;
+    }
+
+    function roundRectPath(c, x, y, w, h, r) {
+      c.beginPath();
+      c.moveTo(x + r, y);
+      c.arcTo(x + w, y, x + w, y + h, r);
+      c.arcTo(x + w, y + h, x, y + h, r);
+      c.arcTo(x, y + h, x, y, r);
+      c.arcTo(x, y, x + w, y, r);
+      c.closePath();
+    }
+
+    async function loadFonts() {
+      const defs = [
+        ['Archivo-1000-700', '/fonts/Archivo-w1000-700.ttf'],
+        ['Plex-400', '/fonts/IBMPlexMono-Regular.ttf'],
+        ['Plex-500', '/fonts/IBMPlexMono-Medium.ttf'],
+      ];
+      await Promise.all(
+        defs.map(async ([family, url]) => {
+          const buf = await (await fetch(url)).arrayBuffer();
+          const ff = new FontFace(family, buf);
+          await ff.load();
+          document.fonts.add(ff);
+        })
+      );
+      await document.fonts.ready;
+    }
+
+    class StudioOverlay {
+      constructor(canvas, compData, lyricsData, jobCfg) {
+        this.canvas = canvas;
+        this.ctx = canvas.getContext('2d', { willReadFrequently: true });
+        this.data = compData;
+        this.job = jobCfg || {};
+        const baseTheme = THEMES[this.job.theme] || THEMES['dark-slate'];
+        this.pal = { ...baseTheme, ...(this.job.palette || {}) };
+        this.isLight = this.pal.mode === 'light';
+
+        this.scale = Number(this.job.scale) || 1.38;
+        this.margin = 14;
+        this.cw = Math.round(PW * this.scale) + this.margin * 2;
+        this.ch = Math.round(PH * this.scale) + this.margin * 2;
+        canvas.width = this.cw;
+        canvas.height = this.ch;
+
+        this.words = [];
+        for (const ln of (lyricsData.lines || [])) {
+          for (let wi = 0; wi < ln.words.length; wi++) {
+            const w = ln.words[wi];
+            this.words.push({ line: ln.i, index: wi, w: w.w, start: w.start, end: w.end });
+          }
+        }
+        this.rawPrefixBytes = [];
+        const enc = new TextEncoder();
+        let acc = 0;
+        for (const tok of compData.tokens) {
+          acc += typeof tok.pieceBytes === 'number' ? tok.pieceBytes : enc.encode(tok.piece).length;
+          this.rawPrefixBytes.push(acc);
+        }
+        this.firstT = compData.tokens[0]?.t0 ?? 0;
+        this.lastT = compData.tokens[compData.tokens.length - 1]?.t1 ?? 200;
+      }
+
+      rgba(key, a = 1) {
+        const hex = this.pal[key] ?? key;
+        const n = parseInt(String(hex).replace('#', ''), 16);
+        return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${a})`;
+      }
+
+      wordAt(t) {
+        const ws = this.words;
+        if (!ws.length || t < ws[0].start) return null;
+        let lo = 0, hi = ws.length - 1;
+        while (lo < hi) {
+          const mid = (lo + hi + 1) >> 1;
+          if (ws[mid].start <= t) lo = mid;
+          else hi = mid - 1;
+        }
+        const w = ws[lo];
+        return t <= w.end + 0.3 ? w : null;
+      }
+
+      tokenAt(t) {
+        const toks = this.data.tokens;
+        if (!toks.length || t < toks[0].t0) return -1;
+        let lo = 0, hi = toks.length - 1;
+        while (lo < hi) {
+          const mid = (lo + hi + 1) >> 1;
+          if (toks[mid].t0 <= t) lo = mid;
+          else hi = mid - 1;
+        }
+        return lo;
+      }
+
+      stepAt(t) {
+        const toks = this.data.tokens;
+        const cur = this.tokenAt(t);
+        if (cur < 0) {
+          return {
+            tok: null, cur: -1, u: 0, end: 0,
+            shownBits: 0, bitFrac: 0, zStart: 0, zEnd: 0, zlibShownBits: 0, zlibBitFrac: 0,
+          };
+        }
+        const tok = toks[cur];
+        const next = toks[cur + 1]?.t0 ?? (tok.t0 + 0.65);
+        const u = clamp((t - tok.t0) / clamp(next - tok.t0, 0.001, 0.52));
+        const bitWin = prog(u, 0.16, 0.56);
+        const end = cur === toks.length - 1 && u >= 0.92 ? this.data.summary.payloadBits : tok.bitEnd;
+        const exactBits = lerp(tok.bitStart, end, bitWin);
+        const shownBits = Math.floor(exactBits + 1e-6);
+        const bitFrac = clamp(exactBits - shownBits, 0, 1);
+
+        const zTotal = this.data.zlibBitstring?.length ?? this.data.summary.zlibBytes * 8;
+        const zStart = tok.zlibBitStart ?? 0;
+        const zEnd = cur === toks.length - 1 && u >= 0.92 ? zTotal : (tok.zlibBitEnd ?? zStart);
+        const zExact = lerp(zStart, zEnd, bitWin);
+        const zlibShownBits = Math.floor(zExact + 1e-6);
+        const zlibBitFrac = clamp(zExact - zlibShownBits, 0, 1);
+
+        return { tok, cur, u, end, shownBits, bitFrac, zStart, zEnd, zlibShownBits, zlibBitFrac };
+      }
+
+      render(t) {
+        const c = this.ctx;
+        c.clearRect(0, 0, this.cw, this.ch);
+
+        const fadeIn = smoothstep(Math.max(0.2, this.firstT - 1.2), Math.max(0.7, this.firstT - 0.35), t);
+        const fadeOut = 1 - smoothstep(this.lastT + 4.5, this.lastT + 6.2, t);
+        const alpha = fadeIn * fadeOut;
+        if (alpha <= 0.004) return;
+
+        c.save();
+        c.globalAlpha = alpha;
+        c.translate(this.margin, this.margin);
+        c.scale(this.scale, this.scale);
+
+        c.save();
+        c.shadowColor = this.isLight ? 'rgba(15, 23, 42, 0.22)' : 'rgba(0, 0, 0, 0.60)';
+        c.shadowBlur = 16;
+        c.shadowOffsetY = 5;
+        roundRectPath(c, 0, 0, PW, PH, 9);
+        c.fillStyle = this.rgba('bg', this.pal.bgAlpha ?? 0.88);
+        c.fill();
+        c.restore();
+
+        c.save();
+        roundRectPath(c, 0, 0, PW, PH, 9);
+        c.clip();
+        const grad = c.createLinearGradient(0, 0, PW, 0);
+        grad.addColorStop(0, this.rgba('accent', 0.09));
+        grad.addColorStop(0.55, this.rgba('bg', 0.0));
+        grad.addColorStop(1, this.rgba('zlib', 0.08));
+        c.fillStyle = grad;
+        c.fillRect(0, 0, PW, 28);
+
+        c.textAlign = 'left';
+        c.textBaseline = 'alphabetic';
+        this.drawContents(c, t, this.wordAt(t));
+        c.restore();
+
+        roundRectPath(c, 0.5, 0.5, PW - 1, PH - 1, 9);
+        c.strokeStyle = this.rgba('border', this.pal.borderAlpha ?? 0.45);
+        c.lineWidth = this.isLight ? 1.2 : 1;
+        c.stroke();
+
+        c.restore();
+      }
+
+      drawContents(c, t, word) {
+        const step = this.stepAt(t);
+        const { tok, cur, u, end, shownBits, bitFrac, zStart, zEnd, zlibShownBits, zlibBitFrac } = step;
+        const toks = this.data.tokens;
+        const sum = this.data.summary;
+        const newBitStart = tok ? tok.bitStart : 0;
+        const flash = tok ? Math.pow(0.5, Math.max(0, t - tok.t0) / 0.1) : 0;
+
+        c.textBaseline = 'alphabetic';
+        c.fillStyle = this.rgba('fg', 0.97);
+        c.font = `700 13px ${FONT_SANS}`;
+        c.fillText('Arithmetic coding', PAD_X, 16.5);
+
+        c.font = `400 9px ${FONT_MONO_REG}`;
+        c.fillStyle = this.rgba('ash', 0.93);
+        c.fillText(sum.modelName, 140, 16);
+
+        const rawBytes = cur >= 0 ? this.rawPrefixBytes[cur] : 0;
+        const encBytes =
+          cur >= 0
+            ? cur === toks.length - 1 && u >= 0.92
+              ? sum.compressedBytes
+              : Math.ceil(shownBits / 8) + sum.headerBytes
+            : 0;
+        const bpb = rawBytes > 0 ? (encBytes * 8) / rawBytes : 0;
+        const ratio = encBytes > 0 && rawBytes > 0 ? rawBytes / encBytes : 0;
+
+        c.textAlign = 'right';
+        if (cur >= 0) {
+          const rightInfo = `${encBytes}/${rawBytes} B`;
+          const statInfo = `${bpb.toFixed(2)} bpb · ${ratio.toFixed(1)}×`;
+          const statFont = `500 9.5px ${FONT_MONO_MED}`;
+          const statW = measure(statInfo, statFont);
+          c.fillStyle = this.rgba('accent', 1);
+          c.font = statFont;
+          c.fillText(statInfo, PW - PAD_X, 16);
+          c.fillStyle = this.rgba('fg', 0.87);
+          c.font = `400 9.5px ${FONT_MONO_REG}`;
+          c.fillText(rightInfo + '  ', PW - PAD_X - statW, 16);
+        } else {
+          c.font = `400 9.5px ${FONT_MONO_REG}`;
+          c.fillStyle = this.rgba('ash', 0.88);
+          c.fillText(`0/${sum.originalBytes} B  ·  STANDBY`, PW - PAD_X, 16);
+        }
+        c.textAlign = 'left';
+
+        c.fillStyle = this.rgba('rule', 0.45);
+        c.fillRect(PLOT_X0, 22.5, PLOT_W, 0.8);
+
+        this.drawTextAndBits(
+          c, cur, rawBytes, encBytes,
+          shownBits, bitFrac, end, newBitStart,
+          zlibShownBits, zlibBitFrac, zEnd, zStart,
+          flash, word,
+        );
+
+        this.drawArithmeticChart(c, cur, u, flash);
+
+        c.fillStyle = this.rgba('rule', 0.38);
+        c.fillRect(PLOT_X0, PH - 5.5, PLOT_W, 2.3);
+        const progFrac = clamp(shownBits / Math.max(1, sum.payloadBits), 0, 1);
+        const pg = c.createLinearGradient(PLOT_X0, 0, PLOT_X1, 0);
+        pg.addColorStop(0, this.pal.signal);
+        pg.addColorStop(1, this.pal.accent);
+        c.fillStyle = pg;
+        c.fillRect(PLOT_X0, PH - 5.5, PLOT_W * progFrac, 2.3);
+      }
+
+      drawBitStream(
+        c, bitsStr, shownBits, bitFrac, end, newBitStart,
+        bitX, bitsW, trackY, trackH, freshKey, baseKey, baseAlpha,
+      ) {
+        const midY = trackY + trackH * 0.5;
+        const FRONT_W = 13.5;
+        const DECAY = 1 - FRONT_W / bitsW;
+        const lnDecay = Math.log(DECAY);
+        const rightX = bitX + bitsW;
+
+        c.fillStyle = this.rgba('track', 0.94);
+        c.fillRect(bitX, trackY, bitsW, trackH);
+        c.fillStyle = this.rgba('rule', 0.45);
+        c.fillRect(bitX, trackY, 1, trackH);
+        c.fillStyle = this.rgba('rule', 0.22);
+        c.fillRect(bitX, midY, bitsW, 0.75);
+
+        c.save();
+        c.beginPath();
+        c.rect(bitX, trackY, bitsW, trackH);
+        c.clip();
+        c.font = `500 18px ${FONT_MONO_MED}`;
+        c.textAlign = 'center';
+        c.textBaseline = 'middle';
+
+        const drawDigit = (ch, cx, scale, key, alpha) => {
+          if (alpha <= 0.015) return;
+          c.save();
+          c.translate(cx, midY);
+          c.scale(scale, scale);
+          c.fillStyle = this.rgba(key, alpha);
+          c.fillText(ch, 0, 1);
+          c.restore();
+        };
+
+        if (bitFrac > 1e-3 && shownBits < end && shownBits < bitsStr.length) {
+          const ch = bitsStr[shownBits] ?? '0';
+          const slotW = bitsW * (1 - Math.pow(DECAY, bitFrac));
+          const scale = slotW / FRONT_W;
+          drawDigit(ch, rightX - slotW * 0.5, scale, freshKey, smoothstep(0.08, 0.55, bitFrac));
+        }
+
+        let tailStartK = -1;
+        for (let k = 0; k < shownBits; k++) {
+          const kEff = k + bitFrac;
+          const r0 = Math.pow(DECAY, kEff);
+          const cellW = bitsW * r0 * (1 - DECAY);
+          if (cellW < 0.45) { tailStartK = k; break; }
+          const xR = bitX + bitsW * r0;
+          const xL = xR - cellW;
+          const scale = cellW / FRONT_W;
+          const cx = (xL + xR) * 0.5;
+          const bitIdx = shownBits - 1 - k;
+          const ch = bitsStr[bitIdx] ?? '0';
+          const fresh = bitIdx >= newBitStart;
+          const key = fresh ? freshKey : baseKey;
+          const aMul = fresh ? 1 : baseAlpha;
+
+          drawDigit(ch, cx, scale, key, smoothstep(2.0, 4.2, cellW) * aMul);
+          const barA = (1 - smoothstep(2.2, 4.6, cellW)) * aMul;
+          if (barA > 0.015) {
+            const bw = Math.max(0.6, cellW * 0.72);
+            const bx = cx - bw * 0.5;
+            const bh = ch === '1' ? Math.max(2.0, 15 * scale) : Math.max(1.0, 6.5 * scale);
+            c.fillStyle = this.rgba(key, ch === '1' ? barA : barA * 0.37);
+            c.fillRect(bx, midY - bh * 0.5, bw, bh);
+          }
+        }
+
+        if (tailStartK >= 0 && tailStartK < shownBits) {
+          const tailRight = bitX + bitsW * Math.pow(DECAY, tailStartK + bitFrac);
+          for (let px = Math.floor(bitX) + 1; px < tailRight; px++) {
+            const dR = Math.max(1e-6, px + 0.5 - bitX);
+            const dL = Math.max(1e-6, px - 0.5 - bitX);
+            const kRight = Math.max(0, Math.log(dR / bitsW) / lnDecay - bitFrac);
+            const kLeft = Math.max(kRight, Math.log(dL / bitsW) / lnDecay - bitFrac);
+            const idxHi = Math.min(shownBits - 1, shownBits - 1 - Math.floor(kRight));
+            const idxLo = Math.max(0, shownBits - 1 - Math.ceil(kLeft));
+            if (idxHi < idxLo) continue;
+
+            const span = idxHi - idxLo + 1;
+            const probes = Math.min(8, span);
+            let ones = 0;
+            for (let s = 0; s < probes; s++) {
+              if (bitsStr[idxLo + Math.floor(((s + 0.5) * span) / probes)] === '1') ones++;
+            }
+            const onesFrac = ones / probes;
+            const hasFresh = idxHi >= newBitStart;
+            const edgeFade = smoothstep(bitX, tailRight, px);
+            const bh = lerp(0.8, 2.0, onesFrac) * (0.35 + 0.65 * edgeFade);
+            c.fillStyle = this.rgba(
+              hasFresh ? freshKey : baseKey,
+              (0.22 + 0.55 * onesFrac) * edgeFade * (hasFresh ? 1 : baseAlpha)
+            );
+            c.fillRect(px - 0.5, midY - bh * 0.5, 1, bh);
+          }
+        }
+        c.restore();
+      }
+
+      drawTextAndBits(
+        c, cur, rawBytes, encBytes,
+        shownBits, bitFrac, end, newBitStart,
+        zlibShownBits, zlibBitFrac, zlibEnd, zlibStart,
+        flash, word,
+      ) {
+        const toks = this.data.tokens;
+        const tok = cur >= 0 ? toks[cur] : null;
+        const split = 198;
+        const leftW = split - PAD_X - 8;
+        const bitX = split + 12;
+        const bitsW = PLOT_X1 - bitX;
+
+        c.font = `500 9px ${FONT_MONO_MED}`;
+        c.fillStyle = this.rgba('ash', 0.88);
+        c.fillText(word ? 'LYRIC  /  TOKEN' : 'INPUT TOKEN', PAD_X, 36);
+
+        c.font = `700 22px ${FONT_SANS}`;
+        const flashKey = this.isLight ? 'signal' : 'accent';
+        c.fillStyle = this.rgba(flash > 0.45 ? flashKey : 'fg', 0.98);
+        const piece = tok?.piece.trim() || tok?.disp || 'ready…';
+        const lyricWord = word && tok && tok.lineIdx === word.line && tok.wordIdx === word.index ? word.w : piece;
+        c.fillText(lyricWord, PAD_X, 61, leftW);
+
+        c.font = `400 9px ${FONT_MONO_REG}`;
+        c.fillStyle = this.rgba('ash', 0.94);
+        c.fillText(tok ? `tok ${tok.i + 1}/${toks.length}  ${tok.disp}  (${tok.bits.toFixed(1)}b)` : 'waiting for vocal…', PAD_X, 79, leftW);
+
+        const zlibEncBytes = Math.ceil(zlibShownBits / 8);
+        const zlibBpb = rawBytes > 0 ? (zlibEncBytes * 8) / rawBytes : 0;
+        if (zlibEncBytes > 0 && encBytes > 0) {
+          const advantage = zlibEncBytes / encBytes;
+          c.font = `500 9px ${FONT_MONO_MED}`;
+          c.fillStyle = this.rgba(advantage >= 1 ? 'accent' : 'ash', 0.98);
+          const cmpStr = advantage >= 1
+            ? `raw ${rawBytes} B · ${advantage.toFixed(2)}× vs zlib`
+            : `raw ${rawBytes} B · zlib ${zlibEncBytes} B`;
+          c.fillText(cmpStr, PAD_X, 97, leftW);
+        }
+
+        c.fillStyle = this.rgba('rule', 0.5);
+        c.fillRect(split, 29, 1, 74);
+
+        c.font = `500 8.5px ${FONT_MONO_MED}`;
+        c.fillStyle = this.rgba('fg', 0.92);
+        c.fillText('LLM ARITHMETIC', bitX, 36);
+        c.textAlign = 'right';
+        c.fillStyle = this.rgba('accent', 1);
+        c.fillText(`${shownBits} b  +${Math.max(0, shownBits - newBitStart)}`, PLOT_X1, 36);
+        c.textAlign = 'left';
+
+        this.drawBitStream(
+          c, this.data.payloadBitstring,
+          shownBits, bitFrac, end, newBitStart,
+          bitX, bitsW, 41, 21.5,
+          this.isLight ? 'signal' : 'accent', 'fg', 0.85,
+        );
+
+        c.font = `500 8.5px ${FONT_MONO_MED}`;
+        c.fillStyle = this.rgba('zlib', 0.98);
+        c.fillText('ZLIB -9 (TRADITIONAL)', bitX, 74);
+        const zAdded = Math.max(0, zlibShownBits - zlibStart);
+        const zDiffStr = `  +${zAdded}`;
+        const zDiffFont = `500 8.5px ${FONT_MONO_MED}`;
+        const zDiffW = measure(zDiffStr, zDiffFont);
+        c.textAlign = 'right';
+        c.fillStyle = this.rgba(this.isLight ? 'zlib' : 'zlibFresh', 0.98);
+        c.font = zDiffFont;
+        c.fillText(zDiffStr, PLOT_X1, 74);
+        c.fillStyle = this.rgba('ash', 0.88);
+        c.font = `400 8.5px ${FONT_MONO_REG}`;
+        c.fillText(`${zlibShownBits} b · ${zlibEncBytes} B · ${zlibBpb.toFixed(2)} bpb`, PLOT_X1 - zDiffW, 74);
+        c.textAlign = 'left';
+
+        this.drawBitStream(
+          c, this.data.zlibBitstring ?? '',
+          zlibShownBits, zlibBitFrac, zlibEnd, zlibStart,
+          bitX, bitsW, 79, 21.5,
+          'zlibFresh', 'zlib', 0.84,
+        );
+      }
+
+      drawArithmeticChart(c, cur, u, flash) {
+        const toks = this.data.tokens;
+        const tok = cur >= 0 ? toks[cur] : null;
+        const zK = tok ? ease.inOutCubic(prog(u, 0.32, 1.0)) : 0;
+
+        let pxL, pxR;
+        if (!tok) {
+          const w0 = PLOT_W * TARGET_FRAC;
+          pxL = PLOT_CX - w0 * 0.5;
+          pxR = PLOT_CX + w0 * 0.5;
+        } else {
+          const wTok = Math.max(1e-12, tok.u1 - tok.u0);
+          const par0 = -tok.u0 / wTok;
+          const par1 = (1 - tok.u0) / wTok;
+          const parW = 1 / wTok;
+          const viewW0 = parW / TARGET_FRAC;
+          const viewW1 = 1 / TARGET_FRAC;
+          const viewW = Math.exp(lerp(Math.log(viewW0), Math.log(viewW1), zK));
+          const c0 = (par0 + par1) * 0.5;
+          const c1 = 0.5;
+          let camC = c1;
+          if (Math.abs(viewW0 - viewW1) > 1e-6 * viewW1) {
+            const z0 = 1 / viewW0, z1 = 1 / viewW1, z = 1 / viewW;
+            const fx = (z1 * c1 - z0 * c0) / (z1 - z0);
+            camC = fx - (z0 / z) * (fx - c0);
+          } else {
+            camC = lerp(c0, c1, zK);
+          }
+          const scalePx = PLOT_W / viewW;
+          pxL = PLOT_CX + (0 - camC) * scalePx;
+          pxR = PLOT_CX + (1 - camC) * scalePx;
+        }
+
+        c.fillStyle = this.rgba('fg', 0.46);
+        c.fillRect(PLOT_X0, AXIS_Y, PLOT_W, 1);
+
+        if (!tok) {
+          c.font = `400 9.5px ${FONT_MONO_REG}`;
+          c.textAlign = 'center';
+          for (let m = 0; m <= 10; m++) {
+            const tx = lerp(pxL, pxR, m / 10);
+            if (tx < PLOT_X0 - 4 || tx > PLOT_X1 + 4) continue;
+            const maj = m % 5 === 0;
+            c.fillStyle = this.rgba('fg', maj ? 0.8 : 0.42);
+            c.fillRect(Math.round(tx), AXIS_Y - (maj ? 5 : 3), 1, maj ? 10 : 6);
+            if (m % 2 === 0 || m === 10) {
+              c.fillStyle = this.rgba('ash', 0.9);
+              c.fillText((m / 10).toFixed(1), tx, AXIS_Y - 8);
+            }
+          }
+          c.textAlign = 'left';
+        } else {
+          c.font = `400 8.5px ${FONT_MONO_REG}`;
+          c.fillStyle = this.rgba('ash', 0.86);
+          const depthStr = tok.axis.dCur >= 8 ? `${tok.axis.prefix}  [1e-${tok.axis.dCur}]` : `interval  [${tok.axis.prefix}]`;
+          c.fillText(depthStr, PLOT_X0, AXIS_Y - 18);
+
+          const pxPerUnit = pxR - pxL;
+          const levels = tok.axis.levels;
+          const drawnLabelXs = [];
+          for (const lv of [...levels].sort((a, b) => b.d - a.d)) {
+            const pxStep = lv.stepRel * pxPerUnit;
+            if (pxStep < 22 || pxStep > 560) continue;
+            const isFinest = lv.d === levels[levels.length - 1].d;
+            const lvAlpha = smoothstep(22, 46, pxStep) * (isFinest ? 1 : 1 - smoothstep(280, 520, pxStep));
+            if (lvAlpha <= 0.02) continue;
+
+            const tickFont = `400 8.5px ${FONT_MONO_REG}`;
+            c.font = tickFont;
+            c.textAlign = 'center';
+            for (const [offset, label, isMajor] of lv.ticks) {
+              const tx = pxL + (lv.originRel + offset * lv.stepRel) * pxPerUnit;
+              if (tx < PLOT_X0 - 2 || tx > PLOT_X1 + 2) continue;
+              const th = isMajor ? 4.5 : 2.5;
+              c.fillStyle = this.rgba('fg', (isMajor ? 0.76 : 0.42) * lvAlpha);
+              c.fillRect(Math.round(tx), AXIS_Y - th, 1, th * 2);
+
+              if (lvAlpha > 0.25 && (isMajor || pxStep >= 42)) {
+                const labelW = measure(label, tickFont);
+                const overlaps = drawnLabelXs.some((ox) => Math.abs(ox - tx) < Math.max(38, labelW + 8));
+                if (!overlaps && tx >= PLOT_X0 + 14 && tx <= PLOT_X1 - 14) {
+                  c.fillStyle = this.rgba('fg', (isMajor ? 0.85 : 0.65) * lvAlpha);
+                  c.fillText(label, tx, AXIS_Y - 6);
+                  drawnLabelXs.push(tx);
+                }
+              }
+            }
+          }
+          c.textAlign = 'left';
+
+          const bitProg = prog(u, 0.16, 0.56);
+          const newCount = tok.bitEnd - tok.bitStart;
+          let b0 = tok.binRel[0], b1 = tok.binRel[1];
+          if (bitProg < 1) {
+            let cur0 = tok.binRelPrev[0], cur1 = tok.binRelPrev[1];
+            const prevPending = cur > 0 ? toks[cur - 1].pending : 0;
+            if (newCount > 0 && prevPending === 0) {
+              const steps = Math.floor(bitProg * newCount);
+              for (let j = 0; j < steps; j++) {
+                const mid = (cur0 + cur1) * 0.5;
+                if (this.data.payloadBitstring[tok.bitStart + j] === '0') cur1 = mid;
+                else cur0 = mid;
+              }
+              const frac = bitProg * newCount - steps;
+              if (steps < newCount && frac > 0) {
+                const mid = (cur0 + cur1) * 0.5;
+                const e = ease.outQuad(frac);
+                if (this.data.payloadBitstring[tok.bitStart + steps] === '0') cur1 = lerp(cur1, mid, e);
+                else cur0 = lerp(cur0, mid, e);
+              }
+              b0 = cur0; b1 = cur1;
+            } else {
+              const e = ease.inOutCubic(bitProg);
+              b0 = lerp(cur0, tok.binRel[0], e);
+              b1 = lerp(cur1, tok.binRel[1], e);
+            }
+          }
+          const bx0 = clamp(pxL + b0 * (pxR - pxL), PLOT_X0, PLOT_X1);
+          const bx1 = clamp(pxL + b1 * (pxR - pxL), PLOT_X0, PLOT_X1);
+          if (bx1 > bx0) {
+            const bw = Math.max(2, bx1 - bx0);
+            c.fillStyle = this.rgba('signal', 0.96);
+            c.fillRect(bx0, AXIS_Y - 1.5, bw, 3.2);
+            if (!this.isLight) {
+              c.fillStyle = this.rgba('accent', 0.92);
+              c.fillRect(bx0, AXIS_Y - 0.5, bw, 1.1);
+            }
+          }
+        }
+
+        const zScroll = tok ? ease.inOutCubic(prog(u, 0.32, 1.0)) : 0;
+        const scrollRows = cur >= MAX_ROWS ? cur - MAX_ROWS + zScroll : 0;
+        const dotsAlpha = cur >= MAX_ROWS ? clamp(scrollRows, 0, 1) : 0;
+        const stackTop = AXIS_Y + lerp(6, 15.5, dotsAlpha);
+
+        if (dotsAlpha > 0.02) {
+          c.fillStyle = this.rgba('fg', 0.7 * dotsAlpha);
+          for (let d = 0; d < 3; d++) {
+            c.beginPath();
+            c.arc(PLOT_CX, AXIS_Y + 4 + d * 3.4, 1.0, 0, Math.PI * 2);
+            c.fill();
+          }
+        }
+
+        c.save();
+        c.beginPath();
+        const clipTop = dotsAlpha > 0.02 ? Math.max(AXIS_Y + 2, stackTop - 1) : AXIS_Y + 2;
+        c.rect(PLOT_X0, clipTop, PLOT_W, PH - clipTop - 9);
+        c.clip();
+
+        if (!tok) {
+          const row0 = toks[0];
+          if (!row0) { c.restore(); return; }
+          this.drawRowSegs(c, row0, pxL, pxR, stackTop, ROW_H, 0.86, false, 0);
+        } else {
+          const firstVisible = Math.max(0, Math.floor(scrollRows) - 1);
+          let childL = pxL, childR = pxR, fullWidthReached = false;
+
+          for (let r = cur; r >= firstVisible; r--) {
+            const rowTok = toks[r];
+            const ry = stackTop + (r - scrollRows) * ROW_STEP;
+            const rowAlpha = clamp(1 + (r - scrollRows), 0, 1);
+            const revealK = r === cur ? ease.outCubic(prog(u, 0.0, 0.22)) : 1;
+            const h = ROW_H * revealK;
+
+            if (fullWidthReached || (childL < PLOT_X0 - 400 && childR > PLOT_X1 + 400)) {
+              fullWidthReached = true;
+              if (rowAlpha > 0.02 && h >= 1) this.drawSolidChosenRow(c, rowTok, ry, h, rowAlpha);
+              continue;
+            }
+
+            const w = Math.max(1e-12, rowTok.u1 - rowTok.u0);
+            const span = childR - childL;
+            const parL = childL - (rowTok.u0 / w) * span;
+            const parR = childL + ((1 - rowTok.u0) / w) * span;
+
+            if (rowAlpha > 0.02 && h >= 1) {
+              this.drawRowSegs(c, rowTok, parL, parR, ry, h, rowAlpha, r === cur, r === cur ? flash : 0, childL, childR);
+            }
+            childL = parL; childR = parR;
+          }
+
+          const botY = stackTop + (cur - scrollRows) * ROW_STEP + ROW_H * ease.outCubic(prog(u, 0.0, 0.22));
+          c.save();
+          c.strokeStyle = this.rgba('fg', this.isLight ? 0.72 : 0.82);
+          c.lineWidth = 1;
+          c.setLineDash([3, 3]);
+          for (const gx of [pxL, pxR]) {
+            if (gx >= PLOT_X0 - 1 && gx <= PLOT_X1 + 1) {
+              c.beginPath();
+              c.moveTo(gx, AXIS_Y);
+              c.lineTo(gx, Math.min(PH - 8, botY));
+              c.stroke();
+            }
+          }
+          c.restore();
+        }
+        c.restore();
+      }
+
+      drawSolidChosenRow(c, tok, y, h, alpha) {
+        const fillKey = this.isLight ? 'accent' : 'signal';
+        c.fillStyle = this.rgba(fillKey, (this.isLight ? 0.1 : 0.14) * alpha);
+        c.fillRect(PLOT_X0, y, PLOT_W, h);
+        c.strokeStyle = this.rgba('accent', (this.isLight ? 0.55 : 0.72) * alpha);
+        c.lineWidth = 1;
+        c.strokeRect(PLOT_X0 + 0.5, y + 0.5, PLOT_W - 1, h - 1);
+        if (h >= 11) {
+          c.font = `500 9.5px ${FONT_MONO_MED}`;
+          c.fillStyle = this.rgba('fg', 0.95 * alpha);
+          c.textAlign = 'center';
+          c.textBaseline = 'middle';
+          c.fillText(tok.disp, PLOT_CX, y + h * 0.5 + 0.5);
+          c.textAlign = 'left';
+          c.textBaseline = 'alphabetic';
+        }
+      }
+
+      drawRowSegs(c, tok, parL, parR, y, h, alpha, isCurrent, flash, chosenOverrideL, chosenOverrideR) {
+        const clipL = Math.max(PLOT_X0, parL);
+        const clipR = Math.min(PLOT_X1, parR);
+        if (clipR <= clipL) return;
+
+        c.fillStyle = this.rgba('track', 0.92 * alpha);
+        c.fillRect(clipL, y, clipR - clipL, h);
+
+        const tickStep = 5;
+        c.fillStyle = this.rgba('rule', 0.26 * alpha);
+        for (let tx = Math.ceil(clipL / tickStep) * tickStep; tx < clipR; tx += tickStep) {
+          c.fillRect(tx, y + 1, 1, h - 2);
+        }
+
+        const w = Math.max(1e-12, tok.u1 - tok.u0);
+        const segs = tok.segs;
+        for (let idx = 0; idx < segs.length; idx++) {
+          const [s0, s1, label] = segs[idx];
+          const isChosen = idx === tok.chosenSeg;
+          let sx0, sx1;
+          if (chosenOverrideL !== undefined && chosenOverrideR !== undefined) {
+            const span = chosenOverrideR - chosenOverrideL;
+            sx0 = chosenOverrideL + ((s0 - tok.u0) / w) * span;
+            sx1 = chosenOverrideL + ((s1 - tok.u0) / w) * span;
+          } else {
+            const pSpan = parR - parL;
+            sx0 = parL + s0 * pSpan;
+            sx1 = parL + s1 * pSpan;
+          }
+          if (sx1 < PLOT_X0 - 2 || sx0 > PLOT_X1 + 2) continue;
+
+          const d0 = Math.max(PLOT_X0, sx0);
+          const d1 = Math.min(PLOT_X1, sx1);
+          const dw = d1 - d0;
+
+          if (isChosen) {
+            const drawW = Math.max(1.5, dw);
+            const drawX = dw < 1.5 ? clamp(sx0, PLOT_X0, PLOT_X1 - 1.5) : d0;
+            const fillKey = this.isLight ? (isCurrent ? 'signal' : 'accent') : 'signal';
+            const fillA = this.isLight
+              ? (isCurrent ? 0.22 + 0.22 * flash : 0.1)
+              : (isCurrent ? 0.56 + 0.24 * flash : 0.14);
+            c.fillStyle = this.rgba(fillKey, fillA * alpha);
+            c.fillRect(drawX, y, drawW, h);
+            const strokeKey = this.isLight ? (isCurrent ? 'signal' : 'accent') : 'accent';
+            c.strokeStyle = this.rgba(strokeKey, (isCurrent ? 0.95 : 0.72) * alpha);
+            c.lineWidth = 1.1;
+            if (dw >= 2) c.strokeRect(drawX + 0.5, y + 0.5, drawW - 1, h - 1);
+          } else if (dw >= 1) {
+            c.fillStyle = this.rgba(idx % 2 === 0 ? 'track' : 'rule', (idx % 2 === 0 ? 0.8 : 0.2) * alpha);
+            c.fillRect(d0, y, dw, h);
+            c.fillStyle = this.rgba('rule', 0.42 * alpha);
+            c.fillRect(d0, y, 0.75, h);
+            c.fillRect(d1 - 0.75, y, 0.75, h);
+          }
+
+          if (label && dw >= 18 && h >= 11) {
+            c.save();
+            c.beginPath();
+            c.rect(d0 + 2, y, dw - 4, h);
+            c.clip();
+            c.font = `${isChosen ? 500 : 400} 9.5px ${isChosen ? FONT_MONO_MED : FONT_MONO_REG}`;
+            c.fillStyle = this.rgba(isChosen ? 'fg' : 'ash', (isChosen ? 0.98 : 0.84) * alpha);
+            c.textAlign = 'center';
+            c.textBaseline = 'middle';
+            c.fillText(label, (d0 + d1) * 0.5, y + h * 0.5 + 0.5);
+            c.restore();
+          }
+        }
+
+        c.fillStyle = this.rgba('fg', this.isLight ? 0.25 : 0.36);
+        c.fillRect(clipL, y, clipR - clipL, 0.75);
+        c.fillRect(clipL, y + h - 0.75, clipR - clipL, 0.75);
+      }
+    }
+
+    async function boot() {
+      const [compData, transcriptData, jobCfg] = await Promise.all([
+        fetch('/data/compression.json').then((r) => r.json()),
+        fetch('/data/transcript.json').then((r) => (r.ok ? r.json() : fetch('/data/lyrics.json').then((r2) => r2.json()))),
+        fetch('/job.json').then((r) => r.json()),
+        loadFonts(),
+      ]);
+      const canvas = document.getElementById('ov');
+      const overlay = new StudioOverlay(canvas, compData, transcriptData, jobCfg);
+
+      const wsMap = new Map();
+      function getWs(url) {
+        if (wsMap.has(url)) return wsMap.get(url);
+        const p = new Promise((res, rej) => {
+          const ws = new WebSocket(url);
+          ws.binaryType = 'arraybuffer';
+          const state = { ws, sent: 0, acked: 0, wake: null };
+          ws.onopen = () => res(state);
+          ws.onerror = () => rej(new Error('WS error'));
+          ws.onmessage = (ev) => {
+            state.acked = Math.max(state.acked, Number(ev.data) || 0);
+            if (state.wake) { const f = state.wake; state.wake = null; f(); }
+          };
+        });
+        wsMap.set(url, p);
+        return p;
+      }
+
+      window.__studio = {
+        ready: true,
+        width: overlay.cw,
+        height: overlay.ch,
+        pngAt(t) {
+          overlay.render(t);
+          return canvas.toDataURL('image/png').split(',')[1];
+        },
+        async streamChunk({ fromFrame, toFrame, fps, wsUrl }) {
+          const st = await getWs(wsUrl);
+          const maxInflight = 8;
+          for (let n = fromFrame; n < toFrame; n++) {
+            while (st.sent - st.acked >= maxInflight) {
+              await new Promise((r) => { st.wake = r; });
+            }
+            overlay.render(n / fps);
+            const img = overlay.ctx.getImageData(0, 0, overlay.cw, overlay.ch);
+            st.ws.send(img.data.buffer);
+            st.sent++;
+          }
+          return toFrame - fromFrame;
+        },
+        async flushWs(wsUrl) {
+          const st = await getWs(wsUrl);
+          while (st.acked < st.sent) {
+            await new Promise((r) => { st.wake = r; });
+          }
+          st.ws.close();
+          wsMap.delete(wsUrl);
+        },
+      };
+    }
+
+    boot().catch((e) => {
+      window.__studio = { error: String(e?.stack ?? e) };
+    });
+  </script>
+</body>
+</html>
